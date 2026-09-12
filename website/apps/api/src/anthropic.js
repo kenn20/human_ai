@@ -1,4 +1,4 @@
-import { CORPORATE_SYSTEM_PROMPT, formatRewriteInput, logLlmRequestIfEnabled, normalizeModelResult, parseJsonText } from "./llm.js";
+import { CORPORATE_SYSTEM_PROMPT, formatRewriteInput, formatWebSearchInput, logLlmRequestIfEnabled, normalizeModelResult, parseJsonText, WEB_SEARCH_SYSTEM_PROMPT } from "./llm.js";
 import { PERSONAS } from "./personas.js";
 
 function extractOutputText(response) {
@@ -51,6 +51,35 @@ export async function rewriteWithAnthropic({
   }
 
   return normalizeModelResult(parseJsonText(extractOutputText(await response.json())), text, "anthropic", policyVersion);
+}
+
+export async function answerWithAnthropic({
+  query,
+  sources = [],
+  apiKey,
+  model,
+  systemPrompt = WEB_SEARCH_SYSTEM_PROMPT,
+  fetchImpl = fetch
+} = {}) {
+  if (typeof query !== "string" || !query.trim()) throw new TypeError("query is required.");
+  if (!apiKey) throw new Error("Anthropic search is not configured.");
+  const response = await fetchImpl("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: requestHeaders(apiKey),
+    body: requestBody({
+      model,
+      systemPrompt,
+      inputText: formatWebSearchInput(query.trim(), sources),
+      stream: false
+    })
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 500);
+    throw new Error(`Anthropic search request failed (${response.status}): ${detail}`);
+  }
+  const answer = extractOutputText(await response.json()).trim();
+  if (!answer) throw new Error("The Anthropic search response was empty.");
+  return answer;
 }
 
 export function partialReplacement(accumulated) {

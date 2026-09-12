@@ -1,9 +1,10 @@
 import { validateRewriteRequest } from "./policy.js";
-import { rewriteWithOpenAI } from "./openai.js";
-import { rewriteWithAnthropic, rewriteWithAnthropicStream } from "./anthropic.js";
-import { rewriteWithClaudeCode } from "./claude-code.js";
+import { answerWithOpenAI, rewriteWithOpenAI, synthesizeSpeechWithOpenAI } from "./openai.js";
+import { answerWithAnthropic, rewriteWithAnthropic, rewriteWithAnthropicStream } from "./anthropic.js";
+import { answerWithClaudeCode, rewriteWithClaudeCode } from "./claude-code.js";
 import { searchExa, ExaProviderError } from "./exa.js";
-import { createVoice, synthesizeSpeech, ElevenLabsProviderError } from "./elevenlabs.js";
+import { createVoice, registerTwilioCall as registerTwilioCallWithElevenLabs, startTwilioCall as startTwilioCallWithElevenLabs, synthesizeSpeech as synthesizeSpeechWithElevenLabs, ElevenLabsProviderError } from "./elevenlabs.js";
+import { twilioFormParams, verifyBearerToken, verifyTwilioSignature } from "./twilio.js";
 import { PERSONAS, personaOptions, resolvePersona } from "./personas.js";
 import {
   DurableConfigError,
@@ -34,6 +35,13 @@ function json(status, body, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { ...JSON_HEADERS, ...extraHeaders }
+  });
+}
+
+function xml(status, body, extraHeaders = {}) {
+  return new Response(body, {
+    status,
+    headers: { "content-type": "application/xml; charset=utf-8", ...extraHeaders }
   });
 }
 
@@ -78,6 +86,12 @@ export function defaultRewrite(provider) {
   if (provider === "anthropic") return rewriteWithAnthropic;
   if (provider === "openai") return rewriteWithOpenAI;
   return rewriteWithClaudeCode;
+}
+
+export function defaultSearchAnswer(provider) {
+  if (provider === "anthropic") return answerWithAnthropic;
+  if (provider === "openai") return answerWithOpenAI;
+  return answerWithClaudeCode;
 }
 
 export function streamingRewrite(provider) {
@@ -144,7 +158,10 @@ export function createHandler(env = process.env, dependencies = {}) {
     host: env.POSTHOG_HOST
   }));
   const exaSearch = dependencies.exaSearch ?? searchExa;
-  const synthesize = dependencies.synthesize ?? synthesizeSpeech;
+  const synthesizeOpenAI = dependencies.synthesizeSpeech ?? synthesizeSpeechWithOpenAI;
+  const synthesizeElevenLabs = dependencies.synthesizeElevenLabsSpeech ?? synthesizeSpeechWithElevenLabs;
+  const registerTwilioCall = dependencies.registerTwilioCall ?? registerTwilioCallWithElevenLabs;
+  const startTwilioCall = dependencies.startTwilioCall ?? startTwilioCallWithElevenLabs;
   const legacyEmpathyEvaluator = !accountDeviceStore && env.NODE_ENV === "test";
   const empathyAccessFor = dependencies.evaluateEmpathyAccess ?? ((accountDistinctId) => evaluateEmpathyAccess({
     distinctId: accountDistinctId,
@@ -221,7 +238,8 @@ export function createHandler(env = process.env, dependencies = {}) {
   return async function handle(request) {
     const url = new URL(request.url);
     const cors = corsHeaders(request, env);
-    const hasBearer = request.headers.has("authorization");
+    const isTelephonyOutbound = request.method === "POST" && url.pathname === "/v1/telephony/twilio/outbound";
+    const hasBearer = request.headers.has("authorization") && !isTelephonyOutbound;
     let accountAuthError = null;
     if (hasBearer) {
       try { await accountFor(request); }
@@ -340,6 +358,64 @@ export function createHandler(env = process.env, dependencies = {}) {
       }, { ...cors, "cache-control": "no-store" });
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/telephony/twilio/incoming") {
+      let form;
+      try { form = await request.formData(); } catch { return xml(400, "<Response><Say>Invalid request.</Say></Response>"); }
+      const params = twilioFormParams(form);
+      if (!env.TWILIO_AUTH_TOKEN) return json(503, { error: "telephony_not_configured", message: "TWILIO_AUTH_TOKEN is not configured." }, cors);
+      if (!verifyTwilioSignature({ url: env.TWILIO_WEBHOOK_URL ?? request.url, params, signature: request.headers.get("x-twilio-signature"), authToken: env.TWILIO_AUTH_TOKEN })) {
+        return json(403, { error: "invalid_twilio_signature", message: "Twilio signature verification failed." }, cors);
+      }
+      const fromNumber = params.get("From");
+      const toNumber = params.get("To");
+      const callSid = params.get("CallSid");
+      if (!fromNumber || !toNumber) return xml(400, "<Response><Say>Missing phone number.</Say></Response>");
+      if (!env.ELEVENLABS_AGENT_ID) return json(503, { error: "telephony_not_configured", message: "ELEVENLABS_AGENT_ID is not configured." }, cors);
+      try {
+        const twiml = await registerTwilioCall({
+          agentId: env.ELEVENLABS_AGENT_ID,
+          fromNumber,
+          toNumber,
+          direction: "inbound",
+          apiKey: env.ELEVENLABS_API_KEY,
+          clientData: callSid ? { dynamic_variables: { call_sid: callSid } } : undefined,
+          ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {})
+        });
+        return xml(200, twiml);
+      } catch (error) {
+        if (error instanceof TypeError) return xml(400, "<Response><Say>Invalid call.</Say></Response>");
+        if (error instanceof ElevenLabsProviderError && error.status === 503) return json(503, { error: "telephony_not_configured", message: "Configure ElevenLabs telephony on the server." }, cors);
+        return json(502, { error: "telephony_provider_failed", message: "Telephony provider failed." }, cors);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/telephony/twilio/outbound") {
+      if (!env.TELEPHONY_OUTBOUND_TOKEN) return json(503, { error: "telephony_not_configured", message: "TELEPHONY_OUTBOUND_TOKEN is not configured." }, cors);
+      if (!verifyBearerToken(request, env.TELEPHONY_OUTBOUND_TOKEN)) return json(401, { error: "telephony_auth_required", message: "A valid telephony token is required." }, cors);
+      let body;
+      try { body = await request.json(); } catch { return json(400, { error: "invalid_json" }, cors); }
+      if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.toNumber !== "string") return json(400, { error: "invalid_request", message: "toNumber is required." }, cors);
+      if (body.callRecordingEnabled !== undefined && typeof body.callRecordingEnabled !== "boolean") return json(400, { error: "invalid_request", message: "callRecordingEnabled must be boolean." }, cors);
+      if (body.clientData !== undefined && (!body.clientData || typeof body.clientData !== "object" || Array.isArray(body.clientData))) return json(400, { error: "invalid_request", message: "clientData must be an object." }, cors);
+      if (!env.ELEVENLABS_AGENT_ID || !env.ELEVENLABS_AGENT_PHONE_NUMBER_ID) return json(503, { error: "telephony_not_configured", message: "ElevenLabs agent phone configuration is missing." }, cors);
+      try {
+        const call = await startTwilioCall({
+          agentId: env.ELEVENLABS_AGENT_ID,
+          agentPhoneNumberId: env.ELEVENLABS_AGENT_PHONE_NUMBER_ID,
+          toNumber: body.toNumber,
+          callRecordingEnabled: body.callRecordingEnabled,
+          clientData: body.clientData,
+          apiKey: env.ELEVENLABS_API_KEY,
+          ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {})
+        });
+        return json(200, call, { ...cors, "cache-control": "no-store" });
+      } catch (error) {
+        if (error instanceof TypeError) return json(400, { error: "invalid_request", message: error.message }, cors);
+        if (error instanceof ElevenLabsProviderError && error.status === 503) return json(503, { error: "telephony_not_configured", message: "Configure ElevenLabs telephony on the server." }, cors);
+        return json(502, { error: "telephony_provider_failed", message: "Telephony provider failed." }, cors);
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/voice/sample") {
       let form;
       try { form = await request.formData(); } catch { return json(400, { error: "invalid_multipart" }, cors); }
@@ -350,8 +426,8 @@ export function createHandler(env = process.env, dependencies = {}) {
         return json(200, { voiceId }, { ...cors, "cache-control": "no-store" });
       } catch (error) {
         if (error instanceof TypeError) return json(400, { error: "invalid_request", message: error.message }, cors);
-        if (error.status === 503) return json(503, { error: "voice_not_configured", message: "Configure ElevenLabs on the server." }, cors);
-        if (error.status === 401 || error.status === 403) return json(502, { error: "voice_not_available", message: "Voice cloning unavailable for this account." }, cors);
+        if (error instanceof ElevenLabsProviderError && error.status === 503) return json(503, { error: "voice_not_configured", message: "Configure ElevenLabs on the server." }, cors);
+        if (error instanceof ElevenLabsProviderError && (error.status === 401 || error.status === 403)) return json(502, { error: "voice_not_available", message: "Voice cloning unavailable for this account." }, cors);
         return json(502, { error: "voice_provider_failed", message: "Voice provider failed." }, cors);
       }
     }
@@ -376,10 +452,43 @@ export function createHandler(env = process.env, dependencies = {}) {
       }, { ...cors, "cache-control": "no-store" });
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/search") {
+      let body;
+      try { body = await request.json(); } catch { return json(400, { error: "invalid_json" }, cors); }
+      if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.query !== "string" || !body.query.trim() || body.query.length > 4000) {
+        return json(400, { error: "invalid_request", message: "query is required and must be 4,000 characters or fewer." }, cors);
+      }
+      if (!env.EXA_API_KEY) return json(503, { error: "search_not_configured", message: "Configure EXA_API_KEY on the server." }, cors);
+      const provider = selectProvider(env);
+      const apiKey = provider === "anthropic" ? env.ANTHROPIC_API_KEY : env.OPENAI_API_KEY;
+      if (provider !== "claude-code" && !apiKey) return json(503, { error: "llm_not_configured", message: "Configure the selected provider key on the server." }, cors);
+      try {
+        const search = await exaSearch({
+          query: body.query,
+          apiKey: env.EXA_API_KEY,
+          ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {})
+        });
+        const answer = await (dependencies.answerSearch ?? defaultSearchAnswer(provider))({
+          query: body.query,
+          sources: search.citations,
+          apiKey,
+          model: providerModel(provider, env),
+          ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {})
+        });
+        return json(200, { query: body.query, answer, citations: search.citations, provider }, { ...cors, "cache-control": "no-store" });
+      } catch (error) {
+        if (error instanceof ExaProviderError && error.status === 503) return json(503, { error: "search_not_configured", message: error.message }, cors);
+        return json(502, { error: "search_failed", message: "Web search failed." }, cors);
+      }
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/translate") {
       let body;
       try { body = await request.json(); } catch { return json(400, { error: "invalid_json" }, cors); }
       if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.text !== "string" || !body.text.trim() || body.text.length > 4000 || !["incoming", "outgoing"].includes(body.direction)) return json(400, { error: "invalid_request", message: "text and direction are required." }, cors);
+      if (body.tone !== undefined && (typeof body.tone !== "string" || !body.tone.trim() || body.tone.length > 1000)) return json(400, { error: "invalid_request", message: "tone must be a non-empty string." }, cors);
+      if (body.voice !== undefined && (typeof body.voice !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.voice))) return json(400, { error: "invalid_request", message: "voice is invalid." }, cors);
+      if (body.ttsProvider !== undefined && !["openai", "elevenlabs"].includes(body.ttsProvider)) return json(400, { error: "invalid_request", message: "ttsProvider must be openai or elevenlabs." }, cors);
       if (body.direction === "outgoing" && body.persona !== undefined) {
         const authorizationError = await authorizePersona(request, body.distinctId, body.persona);
         if (authorizationError) return json(authorizationError.status, { error: authorizationError.error, message: authorizationError.message }, cors);
@@ -395,10 +504,17 @@ export function createHandler(env = process.env, dependencies = {}) {
         } else {
           if (dependencies.translateIncoming) translation = (await dependencies.translateIncoming({ text: body.text })).translation;
           else translation = body.text;
-          if (env.EXA_API_KEY) citations = await searchExa({ query: `${body.text} ${translation}`, apiKey: env.EXA_API_KEY, ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}) });
+          if (env.EXA_API_KEY) citations = await exaSearch({ query: `${body.text} ${translation}`, apiKey: env.EXA_API_KEY, ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}) });
         }
         const output = { direction, original: body.text, translation, citations };
-        if (body.voiceId) { const spoken = await (dependencies.synthesizeSpeech ?? synthesizeSpeech)({ voiceId: body.voiceId, text: translation, apiKey: env.ELEVENLABS_API_KEY, modelId: env.ELEVENLABS_MODEL_ID, ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}) }); output.audio = Buffer.from(spoken.audio).toString("base64"); output.audioContentType = spoken.contentType; }
+        if (body.tone) {
+          const sharedOptions = { text: translation, ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}) };
+          const spoken = body.ttsProvider === "elevenlabs"
+            ? await synthesizeElevenLabs({ ...sharedOptions, voiceId: body.voice ?? env.ELEVENLABS_VOICE_ID, apiKey: env.ELEVENLABS_API_KEY, model: env.ELEVENLABS_MODEL ?? "eleven_multilingual_v2" })
+            : await synthesizeOpenAI({ ...sharedOptions, tone: body.tone, voice: body.voice ?? env.OPENAI_TTS_VOICE ?? "coral", apiKey: env.OPENAI_API_KEY, model: env.OPENAI_TTS_MODEL ?? "gpt-4o-mini-tts" });
+          output.audio = Buffer.from(spoken.audio).toString("base64");
+          output.audioContentType = spoken.contentType;
+        }
         return json(200, output, { ...cors, "cache-control": "no-store" });
       } catch (error) {
         if (error.status === 503) return json(503, { error: "provider_not_configured", message: error.message }, cors);

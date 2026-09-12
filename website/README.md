@@ -3,6 +3,7 @@
 EmapthyAi previews a corporate rewrite before replacing a draft. The MVP contains:
 
 - A policy API backed by the authenticated local Claude Code subscription, Anthropic Claude API, or OpenAI API.
+- An Exa-powered web search endpoint that grounds concise answers in live web results while keeping the answer in EmapthyAi's voice.
 - A Chrome extension for Slack Web and Google Chat that detects the active composer and extracts conversation IDs from the page URL.
 - An Android input method that reviews the active draft and sees the owning app package.
 
@@ -47,6 +48,59 @@ curl -X POST http://127.0.0.1:8787/v1/rewrite \
   -H 'content-type: application/json' \
   -d '{"text":"this makes no sense, this is stupid","context":{"app":"slack"}}'
 ```
+
+Adding `tone` to `/v1/translate` returns the persona-shaped text as
+base64-encoded audio. The optional `ttsProvider` request field selects `openai`
+or `elevenlabs` at runtime; omitting it uses OpenAI. `voice` is optional and
+defaults to `OPENAI_TTS_VOICE` for OpenAI or `ELEVENLABS_VOICE_ID` for
+ElevenLabs. The response adds `audio` and `audioContentType` fields.
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/translate \
+  -H 'content-type: application/json' \
+  -d '{"text":"Hello from EmapthyAi.","direction":"outgoing","persona":"corporate","tone":"Warm and confident","ttsProvider":"elevenlabs"}'
+```
+
+### Live phone calls
+
+The API can hand a Twilio call to an ElevenLabs Conversational AI agent. In
+ElevenLabs, create an agent, connect/import a Twilio phone number, and copy the
+agent ID and phone-number ID into `.env`. Set `TWILIO_AUTH_TOKEN` and configure
+the Twilio number's **A call comes in** webhook as:
+
+```
+https://YOUR_DOMAIN/v1/telephony/twilio/incoming
+```
+
+Use `POST /v1/telephony/twilio/incoming` only as a Twilio webhook. The endpoint
+verifies `X-Twilio-Signature`, calls ElevenLabs' `register-call` API, and returns
+the TwiML that keeps the caller connected to the agent. `TWILIO_WEBHOOK_URL`
+must exactly match the public URL Twilio signs, including HTTPS and any path.
+
+For a server-initiated call, keep `TELEPHONY_OUTBOUND_TOKEN` private and call:
+
+```sh
+curl -X POST https://YOUR_DOMAIN/v1/telephony/twilio/outbound \
+  -H 'authorization: Bearer YOUR_TELEPHONY_OUTBOUND_TOKEN' \
+  -H 'content-type: application/json' \
+  -d '{"toNumber":"+14155550100"}'
+```
+
+Phone numbers must use E.164 format (`+` followed by country code and number).
+Twilio and ElevenLabs still apply their own account, consent, recording, and
+phone-number restrictions.
+
+The web search endpoint keeps both provider keys on the server. It searches with
+Exa, sends the returned source extracts to the configured LLM as untrusted
+context, and returns the synthesized answer with citations.
+
+```sh
+curl -X POST http://127.0.0.1:8787/v1/search \
+  -H 'content-type: application/json' \
+  -d '{"query":"What changed in the latest OpenAI API release?"}'
+```
+
+Set EXA_API_KEY and configure the selected LLM provider before calling it.
 
 ## 2. Install the browser extension
 

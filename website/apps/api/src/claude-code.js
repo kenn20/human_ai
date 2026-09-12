@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { CORPORATE_SYSTEM_PROMPT, formatRewriteInput, logLlmRequestIfEnabled, normalizeModelResult } from "./llm.js";
+import { CORPORATE_SYSTEM_PROMPT, formatRewriteInput, formatWebSearchInput, logLlmRequestIfEnabled, normalizeModelResult, WEB_SEARCH_SYSTEM_PROMPT } from "./llm.js";
 import { PERSONAS } from "./personas.js";
 
 const execFileAsync = promisify(execFile);
@@ -41,4 +41,26 @@ export async function rewriteWithClaudeCode({
   if (envelope.is_error) throw new Error(envelope.result || "Claude Code rewrite failed.");
   const parsed = envelope.structured_output ?? JSON.parse(envelope.result);
   return normalizeModelResult(parsed, text, "claude-code", policyVersion);
+}
+
+export async function answerWithClaudeCode({
+  query,
+  sources = [],
+  model = "sonnet",
+  systemPrompt = WEB_SEARCH_SYSTEM_PROMPT,
+  exec = execFileAsync
+} = {}) {
+  if (typeof query !== "string" || !query.trim()) throw new TypeError("query is required.");
+  const { stdout } = await exec("claude", [
+    "-p",
+    "--no-session-persistence",
+    "--setting-sources", "",
+    "--tools", "",
+    "--model", model,
+    "--system-prompt", systemPrompt,
+    formatWebSearchInput(query.trim(), sources)
+  ], { timeout: 35_000, maxBuffer: 1_000_000 });
+  const answer = stdout.trim();
+  if (!answer) throw new Error("Claude Code search response was empty.");
+  return answer;
 }

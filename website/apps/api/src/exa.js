@@ -26,7 +26,7 @@ export async function searchExa({ query, apiKey, fetchImpl = fetch, timeoutMs = 
     if (!response.ok) throw new ExaProviderError(response.status, "Exa request failed.");
     const payload = await response.json();
     const citations = (Array.isArray(payload.results) ? payload.results : [])
-      .filter((item) => item && typeof item.url === "string" && /^https:\/\//i.test(item.url))
+      .filter((item) => item && typeof item.url === "string" && item.url.length <= 2048 && /^https:\/\//i.test(item.url))
       .slice(0, MAX_CITATIONS)
       .map((item) => ({
         title: typeof item.title === "string" ? item.title.slice(0, 500) : "",
