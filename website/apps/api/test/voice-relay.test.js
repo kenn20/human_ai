@@ -30,12 +30,12 @@ test("voice relay rejects a non-corporate persona", async () => {
   assert.equal(response.status, 400);
 });
 
-test("translation returns OpenAI audio when a tone is requested", async () => {
+test("translation defaults to OpenAI when ttsProvider is omitted", async () => {
   const input = new Uint8Array([73, 68, 51, 4]);
   let rewriteRequest;
   let synthesisRequest;
   const voiceHandler = createHandler(
-    { OPENAI_API_KEY: "test-key", OPENAI_TTS_MODEL: "gpt-4o-mini-tts", OPENAI_TTS_VOICE: "coral", NODE_ENV: "test" },
+    { OPENAI_API_KEY: "test-key", TTS_PROVIDER: "elevenlabs", OPENAI_TTS_MODEL: "gpt-4o-mini-tts", OPENAI_TTS_VOICE: "coral", NODE_ENV: "test" },
     {
       translateRewrite: async (options) => {
         rewriteRequest = options;
@@ -64,6 +64,53 @@ test("translation returns OpenAI audio when a tone is requested", async () => {
   assert.equal(synthesisRequest.tone, "Warm and reassuring");
   assert.equal(synthesisRequest.voice, "coral");
   assert.equal(synthesisRequest.model, "gpt-4o-mini-tts");
+});
+
+test("translation returns ElevenLabs audio when selected at runtime", async () => {
+  const input = new Uint8Array([73, 68, 51, 5]);
+  let synthesisRequest;
+  const voiceHandler = createHandler(
+    {
+      OPENAI_API_KEY: "test-key",
+      TTS_PROVIDER: "openai",
+      ELEVENLABS_API_KEY: "eleven-key",
+      ELEVENLABS_VOICE_ID: "voice_123",
+      ELEVENLABS_MODEL: "eleven_multilingual_v2",
+      NODE_ENV: "test"
+    },
+    {
+      translateRewrite: async () => ({ replacement: "Please read this aloud." }),
+      synthesizeElevenLabsSpeech: async (options) => {
+        synthesisRequest = options;
+        return { audio: input.buffer, contentType: "audio/mpeg" };
+      }
+    }
+  );
+
+  const response = await voiceHandler(new Request("https://example.test/v1/translate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Read this", direction: "outgoing", persona: "corporate", tone: "Warm", ttsProvider: "elevenlabs" })
+  }));
+
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.audio, Buffer.from(input).toString("base64"));
+  assert.equal(body.audioContentType, "audio/mpeg");
+  assert.equal(synthesisRequest.text, "Please read this aloud.");
+  assert.equal(synthesisRequest.voiceId, "voice_123");
+  assert.equal(synthesisRequest.apiKey, "eleven-key");
+  assert.equal(synthesisRequest.model, "eleven_multilingual_v2");
+});
+
+test("translation rejects an invalid runtime TTS provider", async () => {
+  const response = await handler(new Request("https://example.test/v1/translate", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "Read this", direction: "incoming", tone: "Warm", ttsProvider: "unknown" })
+  }));
+
+  assert.equal(response.status, 400);
 });
 
 test("OpenAI speech sends tone instructions and returns audio", async () => {
